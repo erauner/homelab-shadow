@@ -1,0 +1,329 @@
+#!/usr/bin/env groovy
+/**
+ * Jenkinsfile.promote - Promote a pre-release to stable
+ *
+ * Takes a pre-release version (e.g., v0.2.0-rc.3) and promotes it to stable (v0.2.0).
+ * Triggerable from Backstage.
+ */
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    workload-type: ci-builds
+spec:
+  containers:
+  - name: jnlp
+    image: jenkins/inbound-agent:3355.v388858a_47b_33-3-jdk21
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  - name: release
+    image: alpine/git:latest
+    command: ['sleep', '3600']
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+'''
+        }
+    }
+
+    parameters {
+        string(
+            name: 'PRERELEASE_VERSION',
+            defaultValue: '',
+            description: 'Pre-release version to promote (e.g., v0.2.0-rc.3). Leave empty to see available versions.'
+        )
+        string(
+            name: 'RELEASE_NOTES',
+            defaultValue: '',
+            description: 'Release notes for the stable version (optional)'
+        )
+        string(
+            name: 'CALLBACK_ID',
+            defaultValue: '',
+            description: 'Manifest service release ID for status callback (set by Backstage)'
+        )
+    }
+
+    environment {
+        ATHENS_URL = 'https://athens.erauner.dev'
+        MODULE_PATH = 'github.com/erauner/homelab-shadow'
+        MANIFEST_SERVICE_URL = 'https://manifest.erauner.dev'
+    }
+
+    stages {
+        stage('Notify Build Started') {
+            when {
+                expression { params.CALLBACK_ID != '' && params.PRERELEASE_VERSION != '' }
+            }
+            steps {
+                container('release') {
+                    script {
+                        sh 'apk add --no-cache curl'
+                        def payload = """{
+                            "release_id": "${params.CALLBACK_ID}",
+                            "build_status": "BUILDING",
+                            "build_url": "${env.BUILD_URL}",
+                            "build_number": ${env.BUILD_NUMBER}
+                        }"""
+                        writeFile file: 'callback.json', text: payload
+                        sh """
+                            curl -sf -X POST \\
+                                -H "Content-Type: application/json" \\
+                                -d @callback.json \\
+                                "${env.MANIFEST_SERVICE_URL}/api/webhooks/jenkins" || true
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('List Available Pre-releases') {
+            when {
+                expression { params.PRERELEASE_VERSION == '' }
+            }
+            steps {
+                container('release') {
+                    script {
+                        sh 'apk add --no-cache curl jq'
+                        sh 'git fetch --tags'
+
+                        def prereleases = sh(
+                            script: "git tag -l 'v*-rc.*' --sort=-v:refname | head -10",
+                            returnStdout: true
+                        ).trim()
+
+                        if (prereleases) {
+                            echo """
+                            ╔══════════════════════════════════════════════════════════╗
+                            ║         Available Pre-releases (most recent first)       ║
+                            ╠══════════════════════════════════════════════════════════╣
+                            ${prereleases.split('\n').collect { "║  ${it.padRight(54)} ║" }.join('\n')}
+                            ╚══════════════════════════════════════════════════════════╝
+
+                            Re-run this job with PRERELEASE_VERSION set to one of the above.
+                            """
+                        } else {
+                            echo "No pre-releases found. Push to main to create one."
+                        }
+                        error("Please specify PRERELEASE_VERSION parameter")
+                    }
+                }
+            }
+        }
+
+        stage('Validate Pre-release') {
+            when {
+                expression { params.PRERELEASE_VERSION != '' }
+            }
+            steps {
+                container('release') {
+                    script {
+                        sh 'git fetch --tags'
+
+                        // Check if tag exists
+                        def tagExists = sh(
+                            script: "git tag -l '${params.PRERELEASE_VERSION}'",
+                            returnStdout: true
+                        ).trim()
+
+                        if (!tagExists) {
+                            error("Tag ${params.PRERELEASE_VERSION} not found!")
+                        }
+
+                        // Validate it's a pre-release tag
+                        if (!params.PRERELEASE_VERSION.contains('-rc.')) {
+                            error("${params.PRERELEASE_VERSION} is not a pre-release tag (expected format: vX.Y.Z-rc.N)")
+                        }
+
+                        // Extract stable version
+                        env.STABLE_VERSION = params.PRERELEASE_VERSION.split('-rc\\.')[0]
+                        echo "Will promote ${params.PRERELEASE_VERSION} → ${env.STABLE_VERSION}"
+
+                        // Check if stable version already exists
+                        def stableExists = sh(
+                            script: "git tag -l '${env.STABLE_VERSION}'",
+                            returnStdout: true
+                        ).trim()
+
+                        if (stableExists) {
+                            error("Stable version ${env.STABLE_VERSION} already exists!")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Create Stable Release') {
+            when {
+                expression { params.PRERELEASE_VERSION != '' }
+            }
+            steps {
+                container('release') {
+                    withCredentials([usernamePassword(
+                        credentialsId: 'github-app',
+                        usernameVariable: 'GIT_USER',
+                        passwordVariable: 'GIT_TOKEN'
+                    )]) {
+                        script {
+                            sh 'apk add --no-cache curl jq'
+
+                            // Get the commit SHA of the pre-release
+                            def commitSha = sh(
+                                script: "git rev-list -n 1 ${params.PRERELEASE_VERSION}",
+                                returnStdout: true
+                            ).trim()
+
+                            echo "Promoting commit ${commitSha} to ${env.STABLE_VERSION}"
+
+                            // Configure git
+                            sh """
+                                git config user.email "jenkins@erauner.dev"
+                                git config user.name "Jenkins CI"
+                            """
+
+                            // Create stable tag at the same commit
+                            sh """
+                                git tag -a ${env.STABLE_VERSION} ${commitSha} -m "Release ${env.STABLE_VERSION} (promoted from ${params.PRERELEASE_VERSION})"
+                                git remote set-url origin https://\${GIT_USER}:\${GIT_TOKEN}@github.com/erauner/homelab-shadow.git
+                                git push origin ${env.STABLE_VERSION}
+                            """
+
+                            // Get previous stable for changelog link
+                            def prevStable = sh(
+                                script: "git tag -l 'v*' --sort=-v:refname | grep -v 'rc' | grep -v '${env.STABLE_VERSION}' | head -1",
+                                returnStdout: true
+                            ).trim() ?: 'v0.0.0'
+
+                            // Build release body
+                            def releaseBody = "## ${env.STABLE_VERSION}\\n\\n"
+                            if (params.RELEASE_NOTES?.trim()) {
+                                releaseBody += params.RELEASE_NOTES.replace('\n', '\\n').replace('"', '\\"')
+                                releaseBody += "\\n\\n"
+                            }
+                            releaseBody += "Promoted from pre-release: ${params.PRERELEASE_VERSION}\\n\\n"
+                            releaseBody += "---\\n\\n"
+                            releaseBody += "**Full Changelog**: https://github.com/erauner/homelab-shadow/compare/${prevStable}...${env.STABLE_VERSION}\\n\\n"
+                            releaseBody += "**Install**: \\`go get github.com/erauner/homelab-shadow@${env.STABLE_VERSION}\\`"
+
+                            // Create GitHub Release (stable, not pre-release)
+                            def releasePayload = """{
+                                "tag_name": "${env.STABLE_VERSION}",
+                                "name": "${env.STABLE_VERSION}",
+                                "body": "${releaseBody}",
+                                "draft": false,
+                                "prerelease": false
+                            }"""
+
+                            writeFile file: 'release-payload.json', text: releasePayload
+
+                            sh """
+                                curl -sf -X POST \\
+                                    -H "Authorization: token \${GIT_TOKEN}" \\
+                                    -H "Accept: application/vnd.github.v3+json" \\
+                                    -d @release-payload.json \\
+                                    "https://api.github.com/repos/erauner/homelab-shadow/releases" \\
+                                    | jq -r '.html_url'
+                            """
+
+                            echo "Stable release created: https://github.com/erauner/homelab-shadow/releases/tag/${env.STABLE_VERSION}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Warm Athens Cache') {
+            when {
+                expression { params.PRERELEASE_VERSION != '' }
+            }
+            steps {
+                container('release') {
+                    script {
+                        def athensUrl = "${env.ATHENS_URL}/${env.MODULE_PATH}/@v/${env.STABLE_VERSION}.info"
+                        echo "Warming Athens cache: ${athensUrl}"
+
+                        sh """
+                            curl -sf '${athensUrl}' || sleep 5 && curl -sf '${athensUrl}' || true
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (env.STABLE_VERSION) {
+                    echo """
+                    ✅ Stable release ${env.STABLE_VERSION} created!
+
+                    Promoted from: ${params.PRERELEASE_VERSION}
+
+                    To use: go get ${env.MODULE_PATH}@${env.STABLE_VERSION}
+
+                    GitHub: https://github.com/erauner/homelab-shadow/releases/tag/${env.STABLE_VERSION}
+                    Athens: ${env.ATHENS_URL}/${env.MODULE_PATH}/@v/list
+                    """
+                }
+                // Send success callback to manifest service
+                if (params.CALLBACK_ID) {
+                    container('release') {
+                        def payload = """{
+                            "release_id": "${params.CALLBACK_ID}",
+                            "build_status": "SUCCESS",
+                            "build_url": "${env.BUILD_URL}",
+                            "build_number": ${env.BUILD_NUMBER},
+                            "message": "Released ${env.STABLE_VERSION ?: params.PRERELEASE_VERSION}"
+                        }"""
+                        writeFile file: 'callback-success.json', text: payload
+                        sh """
+                            curl -sf -X POST \\
+                                -H "Content-Type: application/json" \\
+                                -d @callback-success.json \\
+                                "${env.MANIFEST_SERVICE_URL}/api/webhooks/jenkins" || true
+                        """
+                    }
+                }
+            }
+        }
+        failure {
+            echo "❌ Promotion failed - check the logs"
+            script {
+                // Send failure callback to manifest service
+                if (params.CALLBACK_ID) {
+                    container('release') {
+                        def payload = """{
+                            "release_id": "${params.CALLBACK_ID}",
+                            "build_status": "FAILURE",
+                            "build_url": "${env.BUILD_URL}",
+                            "build_number": ${env.BUILD_NUMBER},
+                            "message": "Promotion failed"
+                        }"""
+                        writeFile file: 'callback-failure.json', text: payload
+                        sh """
+                            curl -sf -X POST \\
+                                -H "Content-Type: application/json" \\
+                                -d @callback-failure.json \\
+                                "${env.MANIFEST_SERVICE_URL}/api/webhooks/jenkins" || true
+                        """
+                    }
+                }
+            }
+        }
+    }
+}

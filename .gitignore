@@ -1,0 +1,15 @@
+# Binary
+shadow
+/shadow
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Test output
+coverage.out
+*.test
+
+# OS
+.DS_Store
