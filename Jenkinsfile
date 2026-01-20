@@ -55,7 +55,7 @@ pipeline {
 
         stage('Create Pre-release') {
             when {
-                branch 'main'
+                expression { env.BRANCH_NAME == 'main' }
             }
             steps {
                 container('golang') {
@@ -81,7 +81,7 @@ pipeline {
 
         stage('Warm Athens Cache') {
             when {
-                branch 'main'
+                expression { env.BRANCH_NAME == 'main' }
             }
             steps {
                 container('golang') {
