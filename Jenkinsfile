@@ -54,9 +54,6 @@ pipeline {
         }
 
         stage('Create Pre-release') {
-            when {
-                expression { env.BRANCH_NAME == 'main' }
-            }
             steps {
                 container('golang') {
                     withCredentials([usernamePassword(
@@ -80,9 +77,6 @@ pipeline {
         }
 
         stage('Warm Athens Cache') {
-            when {
-                expression { env.BRANCH_NAME == 'main' }
-            }
             steps {
                 container('golang') {
                     script {
