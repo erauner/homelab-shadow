@@ -1,0 +1,22 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: homelab-shadow
+  description: CLI tool for managing shadow deployments and GitOps manifest validation
+  annotations:
+    github.com/project-slug: erauner12/homelab-shadow
+    jenkins.io/job-full-name: erauner/homelab-shadow/main
+    homelab.dev/manifest-name: homelab-shadow
+  tags:
+    - go
+    - cli
+    - gitops
+    - validation
+  links:
+    - url: https://github.com/erauner12/homelab-shadow
+      title: GitHub Repository
+spec:
+  type: library
+  lifecycle: production
+  owner: platform-team
+  system: homelab-infrastructure
