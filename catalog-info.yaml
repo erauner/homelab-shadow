@@ -5,7 +5,7 @@ metadata:
   description: CLI tool for managing shadow deployments and GitOps manifest validation
   annotations:
     github.com/project-slug: erauner/homelab-shadow
-    jenkins.io/job-full-name: erauner/homelab-shadow/main
+    jenkins.io/job-full-name: libraries/homelab-shadow/main
     homelab.dev/manifest-name: homelab-shadow
   tags:
     - go
